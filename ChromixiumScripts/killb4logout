@@ -1,0 +1,8 @@
+#! /bin/bash
+
+killall chromium-browser
+battmon -q
+killall yad
+killall avatar-logout
+killall sh
+killall sleep
