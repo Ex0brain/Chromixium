@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Chromixium Logo
+Description=A theme that features a blank background with a logo.
+ModuleName=script
+
+[script]
+ImageDir=/lib/plymouth/themes/chromixium-logo
+ScriptFile=/lib/plymouth/themes/chromixium-logo/chromixium-logo.script

@@ -1,0 +1,322 @@
+#!/bin/bash
+
+# Install wrapper script for Chromixium OS
+# Version 0.7.6
+# Updated with locale fix
+# Wraps up Systemback installer and provides an automatic partitioning option
+# Post install, chroot into installed system and add swap to fstab
+
+# Copyright RichJack, 2014
+# chromixium@gmail.com
+# Licensed under GPL v3
+
+# Check running as root
+if [[ $EUID -ne 0 ]]; then
+   yad --title="System Install" --text="\n   The installer must be run as root" --button="gtk-quit:1" \
+   --window-icon=systemback --image=changes-prevent  --width=300
+   exit 1
+fi
+
+function getdisk(){
+# Check which is the running system
+LIVEDEV=$(mount | grep cdrom | awk '{print $1}' | sed 's/[0-9]//')
+# Assume 1 hard disk only which is /dev/hda or /dev/sda - this will work in 90% of cases
+PRIHDD=$(lsblk /dev/*da | grep disk | awk '{print $1}')
+PRIHDD=/dev/$PRIHDD
+# Make sure the 2 drives are not the same
+if [[ "$PRIHDD" == "$LIVEDEV" ]]; then 
+	yad --title="System Install" --text="<span font_weight='bold'>Chromixium Installer</span>\n\nSorry, can't automatically detect the best partition for installation.\n\nTried to use $PRIHDD but it seems to be the running live system.\n\nPlease partition your device manually using Gparted." \
+	--button="gtk-quit:1" --button="Launch Gparted:2" \
+	--window-icon=systemback --image-on-top --image=gtk-dialog-warning  --width=500 --height=350 --center
+	ans5=$?
+	if [[ $ans5 == 1 ]];then
+		exit 1
+	else
+		gparted
+		systemback
+		fix_swap
+		fix_locale
+		finished
+		exit 0
+	fi
+fi
+# Get size of disk
+PRISIZE=$(lsblk $PRIHDD | grep disk | awk '{print $4}')
+# Get disk model
+PRIMODEL=$(hdparm -i $PRIHDD | grep -i model | awk -F'=' '{print $2}' | sed 's/, FwRev//')
+
+# Inform user, so chance to bail
+yad --title="System Install" --text="<span font_weight='bold'>Chromixium Installer</span>\n\nThe hard drive that has been automatically detected for\ninstallation is:\n\n$PRIHDD ${PRISIZE}B $PRIMODEL\n\n<span font_weight='bold'>Caution: All data on this device will be permanently erased.</span>\n\nIf this is correct, click Forward, if it is not correct, click Cancel then run the installer again and choose the Manual install method." \
+--width=500 --height=350 --center \
+--window-icon=systemback --image=systemback --image-on-top \
+--button="gtk-cancel:1" --button="gtk-go-forward:0"
+ans1=$?
+
+if [[ "$ans1" != "0" ]]; then
+	exit 1
+fi
+}
+
+
+function autopartition(){
+yad --title="System Install" --text="<span font_weight='bold'>Chromixium Installer</span>\n\nAre you sure that you really want to permanently erase <span font_weight='bold'>all</span> data on\n\n$PRIHDD\n\n" \
+--width=500 --center \
+--window-icon=systemback --image=gtk-dialog-warning --image-on-top \
+--button="gtk-no:1" --button="gtk-yes:0"
+ans2=$?
+
+if [[ "$ans2" != "0" ]]; then
+	exit 1
+fi
+{
+# Unmount everything
+sed -i '/swap/d' /etc/fstab
+swapoff -a
+umount /dev/hd*
+umount /dev/sd*
+wait
+# Recursively delete each partition
+for i in $(parted -s $PRIHDD print|awk '/^ / {print $1}')
+do
+   parted -s $PRIHDD rm $i
+done
+wait
+# Clean MBR including all partitions
+dd if=/dev/zero of=$PRIHDD bs=512 count=1
+wait
+# Wipe track zero
+dd if=/dev/zero of=$PRIHDD bs=512 count=63
+wait
+# Create new msdos partition table
+parted -a optimal -s $PRIHDD mklabel msdos
+wait
+# Check memory size, double it and add 10% for safety
+MEM=$(free -m | grep "Mem:" | awk '{print $2}')
+SWAP=$(echo "scale=0; ($MEM+$MEM)*(110/100)" | bc)
+# Don't go bigger than 4GB + 10%
+if [[ $SWAP -gt 4505 ]]; then
+	SWAP=4505
+fi
+# Create new swap partition at 2 x RAM
+parted -a optimal -s $PRIHDD mkpart primary linux-swap 1 ${SWAP}MiB
+wait
+mkswap ${PRIHDD}1
+wait
+swapon ${PRIHDD}1
+
+# Create one root partition in remaining space
+# PRISTART=$((SWAP + 2))
+parted -a optimal -s $PRIHDD mkpart primary ext4 ${SWAP}MiB 100%
+wait
+mkfs -t ext4 ${PRIHDD}2
+wait
+parted -a optimal -s $PRIHDD set 2 boot on
+wait
+tune2fs -L Chromixium ${PRIHDD}2
+wait
+} | yad --title="System Install" --progress-text="Preparing hard drive partitions.." --progress --pulsate \
+--auto-close --button=gtk-cancel:1 --autokill --width=500 --center --skip-taskbar
+# Collect info
+SWAPSIZE=$(parted $PRIHDD print | grep linux-swap | awk '{print $4}')
+PRISIZE=$(parted $PRIHDD print | grep ext4 | awk '{print $4}')
+wait
+# Tell user what to do next!
+yad --title="System Install" --text="<span font_weight='bold'>Chromixium Installer</span>\n\nThe hard drive has been partitioned as follows:\n\nPartition 1 = ${PRIHDD}1 ${SWAPSIZE} SWAP\nPartition 2 = ${PRIHDD}2 ${PRISIZE} ext4 /\n\n<span font_weight='bold'>Make sure to allocate the root mount point ( / ) on \n${PRIHDD}2 on the installer page and click the green arrow to set it.</span>\n\n" \
+--width=500 --height=350 --center \
+--window-icon=systemback --image=systemback --image-on-top \
+--button="gtk-go-forward:0"
+}
+
+function fix_swap(){
+{
+# Get new install partition assuming it has the label SB@
+INSTPAR=$(blkid | grep SB@ | awk -F ':' '{print $1}')
+if (( $(grep -c . <<<"$INSTPAR") > 1 )); then
+  yad --title="System Install" --text="<span font_weight='bold'>Chromixium Installer</span>\n\nCan't identify which is the new installation and which is an old installation as you have 2 (or more) partitions with the label SB@.\n\nThe system is installed, but we haven't been able to set up the bootloader for hibernation. You can do this manually post-install by following the instructions on the Wiki. " --button="gtk-quit:1" --button="Reboot:2" \
+--window-icon=systemback --image-on-top --image=gtk-dialog-warning --width=300 --height=350 --center
+ans3=$?
+	if [[ $ans3 == "2" ]]; then
+		fix_locale
+		yad-shutdown
+		exit 1
+	else
+		exit 1
+	fi
+fi
+# Set label
+tune2fs -L Chromixium $INSTPAR
+wait
+# Mount new installation
+mkdir -p /mnt/chroot
+mount $INSTPAR /mnt/chroot
+# Remove installer
+rm -f /mnt/chroot/usr/local/share/applications/chromixium-installer.desktop
+# Discover swap partition
+SWAPPART=$(fdisk -l | grep swap | awk '{print $1}')
+# Add Swapp UUID to fstab
+SWAPUUID=$(blkid "$SWAPPART" | awk -F '"' '{print $2}')
+echo "UUID=$SWAPUUID  none    swap    sw    0   0" >> /mnt/chroot/etc/fstab
+# Edit resume file
+rm -f /mnt/chroot/etc/initramfs-tools/conf.d/resume
+echo "resume=UUID=$SWAPUUID" | sudo tee /mnt/chroot/etc/initramfs-tools/conf.d/resume
+# Create new grub file
+rm -f mnt/chroot/etc/default/grub
+sudo tee > /mnt/chroot/etc/default/grub <<'EOF'
+# If you change this file, run 'update-grub' afterwards to update
+# /boot/grub/grub.cfg.
+# For full documentation of the options in this file, see:
+#   info -f grub -n 'Simple configuration'
+
+GRUB_DEFAULT=0
+GRUB_HIDDEN_TIMEOUT=0
+GRUB_HIDDEN_TIMEOUT_QUIET=true
+GRUB_TIMEOUT=10
+GRUB_DISTRIBUTOR=`lsb_release -i -s 2> /dev/null || echo Debian`
+EOF
+
+cmdline="GRUB_CMDLINE_LINUX_DEFAULT=\"quiet splash resume=UUID=$SWAPUUID\""
+sudo echo $cmdline >> /mnt/chroot/etc/default/grub
+sudo cat <<'EOF' >> /mnt/chroot/etc/default/grub
+GRUB_CMDLINE_LINUX=""
+
+# Uncomment to enable BadRAM filtering, modify to suit your needs
+# This works with Linux (no patch required) and with any kernel that obtains
+# the memory map information from GRUB (GNU Mach, kernel of FreeBSD ...)
+#GRUB_BADRAM="0x01234567,0xfefefefe,0x89abcdef,0xefefefef"
+
+# Uncomment to disable graphical terminal (grub-pc only)
+#GRUB_TERMINAL=console
+
+# The resolution used on graphical terminal
+# note that you can use only modes which your graphic card supports via VBE
+# you can see them in real GRUB with the command `vbeinfo'
+#GRUB_GFXMODE=640x480
+
+# Uncomment if you don't want GRUB to pass "root=UUID=xxx" parameter to Linux
+#GRUB_DISABLE_LINUX_UUID=true
+
+# Uncomment to disable generation of recovery mode menu entries
+#GRUB_DISABLE_RECOVERY="true"
+
+# Uncomment to get a beep at grub start
+#GRUB_INIT_TUNE="480 440 1"
+EOF
+
+# Prepare chroot environment
+mount --bind /dev /mnt/chroot/dev
+mount --bind /sys /mnt/chroot/sys
+mount --bind /proc /mnt/chroot/proc
+# Send commands to chroot
+chroot /mnt/chroot update-grub2
+chroot /mnt/chroot update-initramfs -u
+} | yad --title="System Install" --progress-text="Configuring bootloader..." --progress --pulsate \
+--auto-close --button=gtk-cancel:1 --autokill --width=500 --center --skip-taskbar
+}
+
+function fix_locale(){
+# Ask user if they want to alter locale data
+yad --title="System Install" --text="<span font_weight='bold'>Chromixium Installer</span>\n\nDo you want to change the timezone, locale and keyboard layout?\nIt is currently set to:\n\nNew York (Eastern) Time\nUnited States English Keyboard\nUnited States English Locale (en_US).\n\n" \
+--button="gtk-yes:0" --button="gtk-no:1" \
+--window-icon=systemback --image=systemback --image-on-top --width=500 --height=350 --center
+ans4=$?
+if [[ $ans4 == 0 ]]; then
+	# Configure timezone and keyboard on live system
+	dpkg-reconfigure -fgnome tzdata
+	dpkg-reconfigure -fgnome console-data
+	dpkg-reconfigure -fgnome keyboard-configuration
+	# Get list of locales and present to user
+	LOC=$(cat /usr/local/bin/locale_list | yad --list --column="Locale" --column="Language" --column="Country" --separator="" --title="System Install" \
+	--text="<span font_weight='bold'>Chromixium Installer</span>\n\nPlease select your language and country.\nOther language packs can be selected post-installation using the Language Support utility in the Control Panel." \
+	--window-icon=systemback --image=systemback --image-on-top --width=500 --height=350 --center \
+	--print-column=1 --button="Skip:1" --button="gtk-go-forward:0")
+	if [[ ! -z $LOC ]]; then
+		# Set the locale as the default 
+		sed -i s/"en_US"/"$LOC"/g /mnt/chroot/etc/default/locale
+		# Set papersize
+		case "$LOC" in
+			en_US) echo "letter" > /mnt/chroot/etc/papersize;;
+			en_CA) echo "letter" > /mnt/chroot/etc/papersize;;
+			en_PH) echo "letter" > /mnt/chroot/etc/papersize;;
+			*) echo "a4" > /mnt/chroot/etc/papersize;;
+		esac
+	fi
+	# Copy the files created in the live system to the installed system
+	cp -f /etc/default/keyboard /mnt/chroot/etc/default/
+	cp -f /etc/timezone /mnt/chroot/etc/
+	chroot /mnt/chroot dpkg-reconfigure --frontend noninteractive tzdata
+	# Fix the keyboard in lxkeymap so it is ready for user session
+	KEYB=$(grep XKBLAYOUT /etc/default/keyboard | awk -F'"' '{print $2}')
+	KEYV=$(grep XKBVARIANT /etc/default/keyboard | awk -F'"' '{print $2}')
+	KEYO=$(grep XKBOPTIONS /etc/default/keyboard | awk -F'"' '{print $2}')
+	UA=$(dir -I Systemback /mnt/chroot/home)
+	echo "[Global]
+layout = $KEYB
+variant = $KEYV
+option = $KEYO" > /mnt/chroot/home/$UA/.config/lxkeymap.cfg
+fi
+{
+chroot /mnt/chroot update-initramfs -u
+} | yad --title="System Install" --progress-text="Updating locale information..." --progress --pulsate \
+--auto-close --button=gtk-cancel:1 --autokill --width=500 --center --skip-taskbar
+}
+
+function finished(){
+echo "" > /mnt/chroot/etc/wicd/wiredsettings.conf
+# Unmount filesystems
+umount /mnt/chroot/dev
+umount /mnt/chroot/sys
+umount /mnt/chroot/proc
+umount /mnt/chroot
+umount ${PRIHDD}*
+wait
+# Final dialog
+yad --title="System Install" --text='<span font_weight="bold">Chromixium Installer</span>\n\n\Installation complete.\n\nPlease shutdown the computer, remove your live media\n(USB/CD/DVD) and then boot back into your new installtion.\n\nFor further help and support, please visit the chromixium website:\n<a href="http://chromixium.org">http://chromixium.org</a>\n\n...where you will find links to the Support Forum and Wiki.\n\nEnjoy using Chromixium!\n\n' \
+--width=500 --height=350 --center \
+--window-icon=systemback --image=systemback --image-on-top \
+--button="gtk-close:0" --button="Reboot:2"
+ans4=$?
+
+if [[ $ans4 == 2 ]]; then
+	yad-shutdown
+else
+	exit 0
+fi
+}
+
+yad --title="System Install" --text='<span font_weight="bold">Chromixium Installer</span>\n\nThis wizard will help prepare your hard drive and then install Chromixium. Please choose your preferred method:\n\n1. Automatic partitioning (takes over entire primary hard drive eg hda or sda).\n2. Manual partitioning (launches Gparted).\n3. Direct (skips partitioning and proceeds straight to installer).\n4. Legacy (Systemback Installer only, no configuration scripts)\n\nInstallation takes place in 4 phases:\n\na) Hard drive partitioning (auto or manual)\nb) Input new system/user details\nc) Systemback installer installs to hard drive\nd) Configure keyboard and timezone.\n\nThe whole process should take about 10 minutes.' \
+--width=500 --height=350 --center \
+--window-icon=systemback --image=systemback --image-on-top \
+--button="1. Automatic:0" --button="2. Manual:2" --button="3. Direct:3" --button="4. Legacy:4" --button="gtk-cancel:1"
+
+ans=$?
+
+if [[ $ans == 0 ]]; then
+	getdisk
+	autopartition
+	systemback
+	fix_swap
+	fix_locale
+	finished
+	exit 0
+elif [[ $ans == 2 ]]; then
+	gparted
+	systemback
+	fix_swap
+	fix_locale
+	finished
+	exit 0
+elif [[ $ans == 3 ]]; then
+	systemback
+	fix_swap
+	fix_locale
+	finished
+	exit 0
+elif [[ $ans == 4 ]]; then
+	systemback
+	exit 0
+else
+	exit 1
+fi
+
+exit 0
+
